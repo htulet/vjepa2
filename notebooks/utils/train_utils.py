@@ -9,9 +9,11 @@ import numpy as np
 from typing import List, Optional, Tuple, cast, Union, Iterator
 from rtree.index import Index, Property
 import rasterio
+import matplotlib.pyplot as plt
 
 from torch.utils.data import DataLoader, Sampler, Dataset
 from torch.optim import Adam
+import torch.optim.lr_scheduler as lr_scheduler
 from torchgeo.datasets import RasterDataset, stack_samples, BoundingBox, GeoDataset
 from torchgeo.samplers.constants import Units
 from torchgeo.samplers.utils import _to_tuple, get_random_bounding_box, tile_to_chips
@@ -189,22 +191,32 @@ class TileWindowDataset(Dataset):
         tile_idx — int, for debugging / analysis
     """
 
-    def __init__(self, filepath: str, T: int):
+    def __init__(self, filepath: str, T: Union[int, tuple], transforms = None, p: float=0.2):
         # feat_data: (T_total, N, N_patches, embed_dim)
+        
         self.data = torch.from_numpy(
-            np.load(filepath),
-            dtype=torch.float32,
+            np.load(filepath, mmap_mode='r')
         )
-        print(f"{filepath} : {self.data.shape}")
+        print(f"{os.path.basename(filepath)} : {self.data.shape}")
+        #self.data = self.data[:, :100]
         self.T       = T
         self.T_total = self.data.shape[0]
         self.N       = self.data.shape[1]
+        self.T_max = T[-1] if isinstance(T, tuple) else T
 
         # build flat index: list of (tile_idx, t) pairs
+        selected_inds = []
+        
+        for t in range(self.T_total - self.T_max):
+            if np.random.random()<p:
+                selected_inds.append(t)
+        if not selected_inds:
+            selected_inds.append(np.random.randint(self.T_total - self.T_max))
+        print(selected_inds)
         self.indices = [
             (n, t)
             for n in range(self.N)
-            for t in range(self.T_total - self.T)
+            for t in selected_inds
         ]
 
     def __len__(self):
@@ -212,12 +224,11 @@ class TileWindowDataset(Dataset):
 
     def __getitem__(self, idx):
         n, t = self.indices[idx]
-        vec    = self.data[t : t + self.T, n]       # (T, N_patches, embed_dim)
-        target = self.data[t + self.T, n]           # (N_patches, embed_dim)
+        vec    = self.data[t : t + self.T_max, n]       # (T, N_patches, embed_dim)
+        target = self.data[t + self.T_max, n]           # (N_patches, embed_dim)
         return vec, target
 
-
-def run_epoch(classifier, loader, optimizer, loss_fn, train: bool):
+def run_epoch(classifier, loader, optimizer, loss_fn, train: bool, scheduler = None):
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -231,7 +242,6 @@ def run_epoch(classifier, loader, optimizer, loss_fn, train: bool):
             # target: (B, N_patches, embed_dim)
             vec    = vec.to(DEVICE)
             target = target.to(DEVICE).detach()     # stop-gradient on target
-
             predicted = classifier(vec)             # (B, N_patches, embed_dim)
             loss      = loss_fn(predicted, target)
 
@@ -239,63 +249,79 @@ def run_epoch(classifier, loader, optimizer, loss_fn, train: bool):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                if scheduler:
+                    scheduler.step()
 
             total_loss += loss.item()
             n_steps    += 1
 
     return total_loss / n_steps
 
+def train_loop(classifier: nn.Module, feat_dir: str, out_path: str, T: Union[int, tuple], loss_fn: nn.Module, batch_size: int, N_epochs: int, lr: float, n_workers: int = 1):
 
-def train_loop(classifier: nn.Module, feat_dir: str, out_path: str, T: int, loss_fn: nn.Module, batch_size: int, N_epochs: int, lr: float, n_workers: int = 1):
+    def collate_random_T(batch):
+        vecs, targets = zip(*batch)
+        if isinstance(T, tuple):
+            rd_T = np.random.randint(T[0], T[1])
+        else:
+            rd_T = T
+        vecs   = torch.stack([v[-rd_T:] for v in vecs])   # (B, T, N_patches, D)
+        targets = torch.stack(list(targets))            # (B, N_patches, D)
+        return vecs, targets
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    features_files = os.listdir(feat_dir)
-    sep = int(np.ceil(3*len(features_files)/4))
-    train_files = features_files[:sep]
-    val_files = features_files[sep:]
+    features_files = sorted(os.listdir(feat_dir))
+    sep = int(np.floor(3*len(features_files)/4))
+    print(sep)
+    train_files = features_files[:sep]#[:1]
+    val_files = features_files[sep:]#[:1]
     print("Train files : \n", train_files, "\nVal files : \n", val_files)
     
     optimizer = Adam(classifier.parameters(), lr=lr)
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
     classifier.to(DEVICE)
-
+    train_losses, val_losses = [], []
     for epoch in range(N_epochs):
         print(f"\nEpoch {epoch+1}/{N_epochs}")
 
         # Training
         train_loss = 0.0
-        for f in tqdm(train_files, desc="train files"):
+        print("Train : ")
+        for f in train_files:
             dataset = TileWindowDataset(os.path.join(feat_dir, f), T=T)
             loader  = DataLoader(
                 dataset,
                 batch_size=batch_size,
                 shuffle=True,
-                num_workers=n_workers,
-                pin_memory=True,
+                collate_fn = collate_random_T,
             )
-            train_loss += run_epoch(classifier, loader, optimizer, loss_fn, train=True)
+            train_loss += run_epoch(classifier, loader, optimizer, loss_fn, scheduler=scheduler, train=True)
         train_loss /= max(len(train_files), 1)
-
+        train_losses.append(train_loss)
         # Val
         val_loss = 0.0
-        for f in tqdm(val_files, desc="val files"):
+        print("\nValidation : ")
+        for f in val_files:
             dataset = TileWindowDataset(os.path.join(feat_dir, f), T=T)
             loader  = DataLoader(
                 dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=n_workers,
-                pin_memory=True,
+                collate_fn = collate_random_T,
             )
-            val_loss += run_epoch(classifier, loader, optimizer, loss_fn, train=False)
+            val_loss += run_epoch(classifier, loader, optimizer, loss_fn, scheduler=scheduler, train=False)
         val_loss /= max(len(val_files), 1)
 
         print(f"  train loss: {train_loss:.6f}  |  val loss: {val_loss:.6f}")
 
-        # -- checkpoint ------------------------------------------------------
-        torch.save({
-            "epoch":      epoch + 1,
-            "model":      classifier.state_dict(),
-            "train_loss": train_loss,
-            "val_loss":   val_loss,
-        }, out_path)
+        val_losses.append(val_loss)
+        if val_loss == np.min(val_losses):
+            torch.save(classifier.state_dict, os.path.join(out_path, "trained_classif_vjepa_Mbal24_cls.pth"))
+
+    X = np.array([i+1 for i in range(N_epochs)])
+    plt.plot(X, train_losses)
+    plt.plot(X, val_losses)
+    plt.show()
+
+    return train_losses, val_losses
