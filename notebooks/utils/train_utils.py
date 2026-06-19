@@ -178,6 +178,21 @@ def skip_none_collate(batch):
         return None
     return stack_samples(batch)
 
+class RandomZeroMask:
+    """
+    Transform to replace random frames with zeros
+    """
+    def __init__(self, p=0.05):
+        self.p = p
+
+    def __call__(self, x):           # x: (T, N_patches, D) / (T, D)
+        T = x.shape[0]
+        zero_mask = torch.rand(T) > self.p
+        # always keep at least min_keep frames
+        if zero_mask.sum() == 0:
+            zero_mask[np.random.randint(T)] = True
+        shape = (T,) + (1,)*(len(x.shape)-1)
+        return x * zero_mask.view(*shape)
 
 
 class TileWindowDataset(Dataset):
@@ -191,18 +206,20 @@ class TileWindowDataset(Dataset):
         tile_idx — int, for debugging / analysis
     """
 
-    def __init__(self, filepath: str, T: Union[int, tuple], transforms = None, p: float=0.2):
+    def __init__(self, filepath: str, T: Union[int, tuple], transform = None, p: float=0.2):
         # feat_data: (T_total, N, N_patches, embed_dim)
         
         self.data = torch.from_numpy(
             np.load(filepath, mmap_mode='r')
         )
-        print(f"{os.path.basename(filepath)} : {self.data.shape}")
-        #self.data = self.data[:, :100]
+        #self.data = self.data[:, ::10]
+        #print(f"{os.path.basename(filepath)} : {self.data.shape}")
+        
         self.T       = T
         self.T_total = self.data.shape[0]
         self.N       = self.data.shape[1]
         self.T_max = T[-1] if isinstance(T, tuple) else T
+        self.transform = transform
 
         # build flat index: list of (tile_idx, t) pairs
         selected_inds = []
@@ -212,7 +229,7 @@ class TileWindowDataset(Dataset):
                 selected_inds.append(t)
         if not selected_inds:
             selected_inds.append(np.random.randint(self.T_total - self.T_max))
-        print(selected_inds)
+        #print(selected_inds)
         self.indices = [
             (n, t)
             for n in range(self.N)
@@ -226,6 +243,9 @@ class TileWindowDataset(Dataset):
         n, t = self.indices[idx]
         vec    = self.data[t : t + self.T_max, n]       # (T, N_patches, embed_dim)
         target = self.data[t + self.T_max, n]           # (N_patches, embed_dim)
+
+        if self.transform is not None:
+            vec = self.transform(vec)
         return vec, target
 
 def run_epoch(classifier, loader, optimizer, loss_fn, train: bool, scheduler = None):
@@ -237,7 +257,7 @@ def run_epoch(classifier, loader, optimizer, loss_fn, train: bool, scheduler = N
 
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for vec, target in tqdm(loader):
+        for vec, target in loader:
             # vec:    (B, T, N_patches, embed_dim)
             # target: (B, N_patches, embed_dim)
             vec    = vec.to(DEVICE)
@@ -257,7 +277,7 @@ def run_epoch(classifier, loader, optimizer, loss_fn, train: bool, scheduler = N
 
     return total_loss / n_steps
 
-def train_loop(classifier: nn.Module, feat_dir: str, out_path: str, T: Union[int, tuple], loss_fn: nn.Module, batch_size: int, N_epochs: int, lr: float, n_workers: int = 1):
+def train_loop(classifier: nn.Module, feat_dir: str, out_path: str, T: Union[int, tuple], loss_fn: nn.Module, batch_size: int, N_epochs: int, lr: float, p_mask: float = 0.05, n_workers: int = 1):
 
     def collate_random_T(batch):
         vecs, targets = zip(*batch)
@@ -277,9 +297,11 @@ def train_loop(classifier: nn.Module, feat_dir: str, out_path: str, T: Union[int
     train_files = features_files[:sep]#[:1]
     val_files = features_files[sep:]#[:1]
     print("Train files : \n", train_files, "\nVal files : \n", val_files)
+
+    transforms = RandomZeroMask(p=p_mask)
     
     optimizer = Adam(classifier.parameters(), lr=lr)
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
     classifier.to(DEVICE)
     train_losses, val_losses = [], []
     for epoch in range(N_epochs):
@@ -288,8 +310,8 @@ def train_loop(classifier: nn.Module, feat_dir: str, out_path: str, T: Union[int
         # Training
         train_loss = 0.0
         print("Train : ")
-        for f in train_files:
-            dataset = TileWindowDataset(os.path.join(feat_dir, f), T=T)
+        for f in tqdm(train_files):
+            dataset = TileWindowDataset(os.path.join(feat_dir, f), T=T, transform=transforms)
             loader  = DataLoader(
                 dataset,
                 batch_size=batch_size,
@@ -302,8 +324,8 @@ def train_loop(classifier: nn.Module, feat_dir: str, out_path: str, T: Union[int
         # Val
         val_loss = 0.0
         print("\nValidation : ")
-        for f in val_files:
-            dataset = TileWindowDataset(os.path.join(feat_dir, f), T=T)
+        for f in tqdm(val_files):
+            dataset = TileWindowDataset(os.path.join(feat_dir, f), T=T, transform=transforms)
             loader  = DataLoader(
                 dataset,
                 batch_size=batch_size,
@@ -317,7 +339,7 @@ def train_loop(classifier: nn.Module, feat_dir: str, out_path: str, T: Union[int
 
         val_losses.append(val_loss)
         if val_loss == np.min(val_losses):
-            torch.save(classifier.state_dict, os.path.join(out_path, "trained_classif_vjepa_Mbal24_cls.pth"))
+            torch.save(classifier.state_dict, os.path.join(out_path, "trained_classif_vjepa_Mbal24cls30.pth"))
 
     X = np.array([i+1 for i in range(N_epochs)])
     plt.plot(X, train_losses)
