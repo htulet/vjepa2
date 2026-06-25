@@ -339,7 +339,7 @@ def train_loop(classifier: nn.Module, feat_dir: str, out_path: str, T: Union[int
 
         val_losses.append(val_loss)
         if val_loss == np.min(val_losses):
-            torch.save(classifier.state_dict, os.path.join(out_path, "trained_classif_vjepa_Mbal24cls30.pth"))
+            torch.save(classifier.state_dict, out_path)
 
     X = np.array([i+1 for i in range(N_epochs)])
     plt.plot(X, train_losses)
