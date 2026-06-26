@@ -222,19 +222,17 @@ class TileWindowDataset(Dataset):
         self.transform = transform
 
         # build flat index: list of (tile_idx, t) pairs
-        selected_inds = []
-        
-        for t in range(self.T_total - self.T_max):
-            if np.random.random()<p:
-                selected_inds.append(t)
-        if not selected_inds:
-            selected_inds.append(np.random.randint(self.T_total - self.T_max))
-        #print(selected_inds)
-        self.indices = [
-            (n, t)
-            for n in range(self.N)
-            for t in selected_inds
-        ]
+        indices = []
+        for n in range(self.N):
+            selected_inds = []
+            for t in range(self.T_max, self.T_total):           #self.T_total - self.T_max
+                if np.random.random()<p:
+                    selected_inds.append(t)
+            if not selected_inds:
+                selected_inds.append(np.random.randint(self.T_max, self.T_total))           #self.T_total - self.T_max
+            indices.extend([(n, t) for t in selected_inds])
+
+        self.indices = indices
 
     def __len__(self):
         return len(self.indices)
