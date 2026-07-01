@@ -171,6 +171,9 @@ def polygon_to_bbox(polygon, buffer=None):
     bounds[1], bounds[2] = bounds[2], bounds[1]
     return BoundingBox(*bounds, 0.0, 9.223372036854776e+18)
 
+def bbox_to_tuple(bbox):
+    return (bbox.minx, bbox.maxx, bbox.miny, bbox.maxy, bbox.mint, bbox.maxt)
+
 def skip_none_collate(batch):
     """Collate function that filters out None samples."""
     batch = [item for item in batch if item is not None]
@@ -194,6 +197,28 @@ class RandomZeroMask:
         shape = (T,) + (1,)*(len(x.shape)-1)
         return x * zero_mask.view(*shape)
 
+class CustomBboxSampler(GeoSampler):
+
+    def __init__(
+        self,
+        dataset: GeoDataset,
+        bb_path : str,
+        roi: Optional[BoundingBox] = None,
+        units: Units = Units.PIXELS,
+    ) -> None:
+       
+        #super().__init__(dataset, roi)
+
+        arr = np.load(bb_path, allow_pickle=True)
+        bboxes = [BoundingBox(*row) for row in arr]
+        self.bboxes = bboxes
+
+    def __iter__(self) -> Iterator[BoundingBox]:
+        for bbox in self.bboxes:
+            yield bbox
+
+    def __len__(self) -> int:
+        return len(self.bboxes)
 
 class TileWindowDataset(Dataset):
     """
